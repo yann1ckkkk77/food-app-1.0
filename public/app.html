@@ -7346,6 +7346,15 @@
 
     const app = new PremiumApp();
     window.app = app;
+    // ---- Kochmodus: Wiederherstellung nach Reload ----
+    try { app.restoreCookModeFromStorage(); app.render(); } catch(e) { console.warn('cook restore', e); }
+    // Bei Sichtbarkeitswechsel Tick sofort ausführen, damit Restzeit / Ablauf-Erkennung stimmt.
+    try {
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) { try { app._cookTick(); } catch(e){} }
+      });
+      window.addEventListener('focus', () => { try { app._cookTick(); } catch(e){} });
+    } catch(e) {}
   </script>
 
   <!-- ==================== COMMUNITY EXTENSIONS ==================== -->
