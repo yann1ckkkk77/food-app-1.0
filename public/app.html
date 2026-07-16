@@ -7137,11 +7137,15 @@
         }
 
         const cookHtml = this.renderCookMode();
+        const cookMinibarHtml = this.renderCookMinibar ? this.renderCookMinibar() : '';
+        const cookToastHtml = this.renderCookToast ? this.renderCookToast() : '';
         root.innerHTML = `
           <div class="app">
             <div class="content">${content}</div>
             ${modalHtml}
             ${cookHtml}
+            ${cookMinibarHtml}
+            ${cookToastHtml}
             ${extraOverlay || ''}
             <nav class="navbar">
               <button class="nav-btn ${this.state.activeTab === 'discover' ? 'active' : ''}" onclick="app.setTab('discover')">🔎<span>Entdecken</span></button>
@@ -7153,6 +7157,7 @@
           </div>
         `;
       }
+
 
       // ===================== SHOPPING (Body) =====================
       renderShoppingBody() {
