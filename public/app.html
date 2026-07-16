@@ -4951,16 +4951,124 @@
       }
 
       // ============ KOCHMODUS ============
+      // Timer state:
+      //   this.state.cookTimer = { recipeId, stepIndex, seconds, endTime, pausedRemaining }
+      //     - endTime: absolute epoch ms when timer ends (running)
+      //     - pausedRemaining: remaining seconds if paused (running -> null)
+      // Cook state:
+      //   this.state.cookMode = { recipeId, stepIndex, minimized }
+      // Persisted in localStorage under 'cookStateV2'.
+
+      _cookPersistKey: 'cookStateV2',
+
+      _findRecipeById(id) {
+        try {
+          if (typeof allRecipes !== 'undefined') {
+            const r = allRecipes.find(x => x.id === id);
+            if (r) return r;
+          }
+        } catch(e) {}
+        if (Array.isArray(this.state.favorites)) {
+          const r = this.state.favorites.find(x => x.id === id);
+          if (r) return r;
+        }
+        return null;
+      }
+
+      _writeCookPersist() {
+        try {
+          const cm = this.state.cookMode;
+          if (!cm) { localStorage.removeItem(this._cookPersistKey); return; }
+          const ct = this.state.cookTimer;
+          const payload = {
+            recipeId: cm.recipeId,
+            stepIndex: cm.stepIndex,
+            minimized: !!cm.minimized,
+            timer: ct ? {
+              recipeId: ct.recipeId,
+              stepIndex: ct.stepIndex,
+              seconds: ct.seconds,
+              endTime: ct.endTime,
+              pausedRemaining: ct.pausedRemaining
+            } : null
+          };
+          localStorage.setItem(this._cookPersistKey, JSON.stringify(payload));
+        } catch(e) {}
+      }
+
+      _readCookPersist() {
+        try { return JSON.parse(localStorage.getItem(this._cookPersistKey) || 'null'); }
+        catch { return null; }
+      }
+
+      restoreCookModeFromStorage() {
+        const data = this._readCookPersist();
+        if (!data || !data.recipeId) return;
+        const recipe = this._findRecipeById(data.recipeId);
+        if (!recipe) { localStorage.removeItem(this._cookPersistKey); return; }
+        this.state.selectedRecipe = recipe;
+        this.state.cookMode = {
+          recipeId: recipe.id,
+          stepIndex: Math.max(0, Math.min((recipe.steps || []).length - 1, data.stepIndex || 0)),
+          minimized: !!data.minimized
+        };
+        if (data.timer) {
+          const t = data.timer;
+          // If timer already expired while away, fire ended state.
+          if (t.pausedRemaining == null && typeof t.endTime === 'number' && t.endTime <= Date.now()) {
+            this.state.cookTimer = null;
+            this._writeCookPersist();
+          } else {
+            this.state.cookTimer = {
+              recipeId: t.recipeId,
+              stepIndex: t.stepIndex,
+              seconds: t.seconds,
+              endTime: t.endTime,
+              pausedRemaining: t.pausedRemaining == null ? null : t.pausedRemaining
+            };
+          }
+        }
+        this._startTickLoop();
+      }
+
       startCookMode() {
         if (!this.state.selectedRecipe) return;
-        this.state.cookMode = { stepIndex: 0 };
-        this.stopCookTimer();
+        // A running timer must NEVER be reset by starting/entering cook mode.
+        const rid = this.state.selectedRecipe.id;
+        // Preserve existing timer only if it belongs to this recipe.
+        if (this.state.cookTimer && this.state.cookTimer.recipeId !== rid) {
+          this._clearCookTimer();
+        }
+        this.state.cookMode = { recipeId: rid, stepIndex: 0, minimized: false };
+        this._writeCookPersist();
+        this._startTickLoop();
         this.render();
       }
 
       exitCookMode() {
+        // X-Button beendet Kochmodus vollständig inkl. Timer.
         this.state.cookMode = null;
-        this.stopCookTimer();
+        this._clearCookTimer();
+        this._stopTickLoop();
+        try { localStorage.removeItem(this._cookPersistKey); } catch(e){}
+        this._dismissToast();
+        this.render();
+      }
+
+      minimizeCookMode() {
+        if (!this.state.cookMode) return;
+        this.state.cookMode.minimized = true;
+        this._writeCookPersist();
+        this.render();
+      }
+
+      restoreCookMode() {
+        if (!this.state.cookMode) return;
+        this.state.cookMode.minimized = false;
+        // Ensure selectedRecipe matches (in case user navigated).
+        const recipe = this._findRecipeById(this.state.cookMode.recipeId);
+        if (recipe) this.state.selectedRecipe = recipe;
+        this._writeCookPersist();
         this.render();
       }
 
@@ -4969,7 +5077,8 @@
         const steps = this.state.selectedRecipe.steps || [];
         if (this.state.cookMode.stepIndex < steps.length - 1) {
           this.state.cookMode.stepIndex++;
-          this.stopCookTimer();
+          // Timer läuft schrittübergreifend weiter – NICHT stoppen.
+          this._writeCookPersist();
           this.render();
         }
       }
@@ -4978,14 +5087,13 @@
         if (!this.state.cookMode) return;
         if (this.state.cookMode.stepIndex > 0) {
           this.state.cookMode.stepIndex--;
-          this.stopCookTimer();
+          this._writeCookPersist();
           this.render();
         }
       }
 
       extractTimerFromStep(text) {
         if (!text) return null;
-        // Match "10 Minuten", "5 Min", "30 Sekunden", "1 Stunde"
         const m = text.match(/(\d+)\s*(Stunden?|Std|Minuten?|Min|Sekunden?|Sek)\b/i);
         if (!m) return null;
         const n = parseInt(m[1], 10);
@@ -4996,88 +5104,279 @@
         return { seconds, label: m[0] };
       }
 
-      stopCookTimer() {
-        if (this._cookTimerInterval) {
-          clearInterval(this._cookTimerInterval);
-          this._cookTimerInterval = null;
-        }
+      _clearCookTimer() {
         this.state.cookTimer = null;
+        this._writeCookPersist();
+      }
+
+      _cookTimerRemainingMs() {
+        const t = this.state.cookTimer;
+        if (!t) return 0;
+        if (t.pausedRemaining != null) return Math.max(0, t.pausedRemaining * 1000);
+        return Math.max(0, t.endTime - Date.now());
+      }
+
+      _cookTimerIsRunning() {
+        const t = this.state.cookTimer;
+        return !!(t && t.pausedRemaining == null && t.endTime > Date.now());
+      }
+
+      _cookTimerExpired() {
+        const t = this.state.cookTimer;
+        return !!(t && t.pausedRemaining == null && t.endTime <= Date.now());
+      }
+
+      async _ensureNotificationPermission() {
+        try {
+          if (typeof Notification === 'undefined') return 'unsupported';
+          if (Notification.permission === 'granted') return 'granted';
+          if (Notification.permission === 'denied') return 'denied';
+          if (this._notificationAsked) return Notification.permission;
+          this._notificationAsked = true;
+          const res = await Notification.requestPermission();
+          return res;
+        } catch(e) { return 'error'; }
       }
 
       startCookTimer(seconds) {
-        this.stopCookTimer();
-        this.state.cookTimer = { remaining: seconds, total: seconds, running: true };
-        this._cookTimerInterval = setInterval(() => {
-          if (!this.state.cookTimer || !this.state.cookTimer.running) return;
-          this.state.cookTimer.remaining--;
-          if (this.state.cookTimer.remaining <= 0) {
-            this.state.cookTimer.remaining = 0;
-            this.state.cookTimer.running = false;
-            clearInterval(this._cookTimerInterval);
-            this._cookTimerInterval = null;
-            try {
-              if (navigator.vibrate) navigator.vibrate([200, 100, 200, 100, 400]);
-            } catch(e) {}
-            alert('⏰ Timer abgelaufen!');
-          }
-          this.updateCookTimerDisplay();
-        }, 1000);
+        if (!this.state.cookMode) return;
+        // Only one active timer at a time – ersetze bestehenden.
+        const rid = this.state.cookMode.recipeId;
+        const step = this.state.cookMode.stepIndex;
+        this.state.cookTimer = {
+          recipeId: rid,
+          stepIndex: step,
+          seconds: seconds,
+          endTime: Date.now() + seconds * 1000,
+          pausedRemaining: null
+        };
+        this._writeCookPersist();
+        this._startTickLoop();
+        // Fire permission request on first user-initiated start.
+        this._ensureNotificationPermission();
         this.render();
       }
 
       toggleCookTimer() {
-        if (!this.state.cookTimer) return;
-        this.state.cookTimer.running = !this.state.cookTimer.running;
+        const t = this.state.cookTimer;
+        if (!t) return;
+        if (t.pausedRemaining == null) {
+          // running -> pause
+          const rem = Math.max(0, Math.ceil((t.endTime - Date.now()) / 1000));
+          t.pausedRemaining = rem;
+        } else {
+          // paused -> resume
+          t.endTime = Date.now() + t.pausedRemaining * 1000;
+          t.pausedRemaining = null;
+        }
+        this._writeCookPersist();
         this.render();
       }
 
       resetCookTimer() {
-        this.stopCookTimer();
+        this._clearCookTimer();
+        this._stopTickLoopIfIdle();
         this.render();
       }
 
       formatCookTime(secs) {
         secs = Math.max(0, secs | 0);
-        const m = Math.floor(secs / 60);
+        const h = Math.floor(secs / 3600);
+        const m = Math.floor((secs % 3600) / 60);
         const s = secs % 60;
+        if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
         return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
       }
 
-      updateCookTimerDisplay() {
-        const el = document.getElementById('cook-timer-display');
-        if (el && this.state.cookTimer) {
-          el.textContent = this.formatCookTime(this.state.cookTimer.remaining);
+      _startTickLoop() {
+        if (this._cookTickTimer) return;
+        this._cookTickTimer = setInterval(() => this._cookTick(), 500);
+      }
+
+      _stopTickLoop() {
+        if (this._cookTickTimer) {
+          clearInterval(this._cookTickTimer);
+          this._cookTickTimer = null;
         }
       }
 
+      _stopTickLoopIfIdle() {
+        if (!this.state.cookTimer && !this.state.cookMode) this._stopTickLoop();
+      }
+
+      _cookTick() {
+        const t = this.state.cookTimer;
+        if (!t) { this._stopTickLoopIfIdle(); return; }
+        // Update UI displays without decrementing internal state.
+        const remMs = this._cookTimerRemainingMs();
+        const secs = Math.ceil(remMs / 1000);
+        const txt = this.formatCookTime(secs);
+        const displays = document.querySelectorAll('[data-cook-timer-display]');
+        displays.forEach(el => { el.textContent = txt; });
+        // Expiry check
+        if (t.pausedRemaining == null && t.endTime <= Date.now()) {
+          this._onCookTimerEnd();
+        }
+      }
+
+      _onCookTimerEnd() {
+        const t = this.state.cookTimer;
+        if (!t) return;
+        const recipe = this._findRecipeById(t.recipeId);
+        const stepIdx = t.stepIndex;
+        // Clear timer state (single active timer).
+        this._clearCookTimer();
+        // Vibration
+        try { if (navigator.vibrate) navigator.vibrate([220, 120, 220, 120, 400]); } catch(e){}
+        // Toast (modern in-app)
+        this._showToast({
+          title: '⏰ Timer abgelaufen!',
+          sub: (recipe ? recipe.title : 'Rezept') + ' – Schritt ' + (stepIdx + 1),
+          variant: 'alarm',
+          duration: 8000
+        });
+        // System notification
+        this._fireCookNotification(recipe, stepIdx);
+        this.render();
+      }
+
+      _fireCookNotification(recipe, stepIdx) {
+        try {
+          if (typeof Notification === 'undefined') return;
+          if (Notification.permission !== 'granted') return;
+          const title = '⏰ Timer abgelaufen!';
+          const body = (recipe ? recipe.title : 'Rezept') + ' – Schritt ' + (stepIdx + 1);
+          // Prefer SW-based notification when installed as PWA (iOS PWA requirement)
+          if ('serviceWorker' in navigator && navigator.serviceWorker.ready) {
+            navigator.serviceWorker.ready.then(reg => {
+              try {
+                reg.showNotification(title, {
+                  body,
+                  icon: '/favicon.ico',
+                  badge: '/favicon.ico',
+                  tag: 'cook-timer',
+                  renotify: true,
+                  vibrate: [220, 120, 220, 120, 400]
+                });
+              } catch(e) {
+                try { new Notification(title, { body, icon: '/favicon.ico', tag: 'cook-timer' }); } catch(_) {}
+              }
+            }).catch(() => {
+              try { new Notification(title, { body, icon: '/favicon.ico', tag: 'cook-timer' }); } catch(_) {}
+            });
+          } else {
+            new Notification(title, { body, icon: '/favicon.ico', tag: 'cook-timer' });
+          }
+        } catch(e) {}
+      }
+
+      _showToast(opts) {
+        this._dismissToast();
+        this.state.cookToast = {
+          title: opts.title || '',
+          sub: opts.sub || '',
+          variant: opts.variant || 'info',
+          id: Date.now()
+        };
+        const dur = Math.max(1500, opts.duration || 4000);
+        this._toastTimer = setTimeout(() => this._dismissToast(true), dur);
+        this.render();
+      }
+
+      _dismissToast(rerender) {
+        if (this._toastTimer) { clearTimeout(this._toastTimer); this._toastTimer = null; }
+        if (this.state.cookToast) {
+          this.state.cookToast = null;
+          if (rerender) this.render();
+        }
+      }
+
+      dismissCookToast() { this._dismissToast(true); }
+
+      renderCookToast() {
+        const tt = this.state.cookToast;
+        if (!tt) return '';
+        return `
+          <div class="cook-toast ${tt.variant === 'alarm' ? 'alarm' : ''}" role="status" aria-live="polite">
+            <div class="cook-toast-body">
+              <div class="cook-toast-title">${escapeHtml(tt.title)}</div>
+              ${tt.sub ? `<div class="cook-toast-sub">${escapeHtml(tt.sub)}</div>` : ''}
+            </div>
+            <button class="cook-toast-close" onclick="app.dismissCookToast()" aria-label="Schließen">×</button>
+          </div>
+        `;
+      }
+
+      renderCookMinibar() {
+        const cm = this.state.cookMode;
+        if (!cm || !cm.minimized) return '';
+        const recipe = this._findRecipeById(cm.recipeId);
+        if (!recipe) return '';
+        const steps = recipe.steps || [];
+        const t = this.state.cookTimer;
+        const running = this._cookTimerIsRunning();
+        const rem = t ? this.formatCookTime(Math.ceil(this._cookTimerRemainingMs() / 1000)) : '';
+        return `
+          <div class="cook-minibar" onclick="app.restoreCookMode()" role="button" aria-label="Kochmodus öffnen">
+            <div class="cook-minibar-icon">👨‍🍳</div>
+            <div class="cook-minibar-body">
+              <div class="cook-minibar-title">${escapeHtml(recipe.title)}</div>
+              <div class="cook-minibar-meta">
+                <span>Schritt ${cm.stepIndex + 1} von ${steps.length}</span>
+                ${t ? `<span class="cook-minibar-timer ${running ? 'running' : ''}" data-cook-timer-display>${rem}</span>` : ''}
+              </div>
+            </div>
+            <button class="cook-minibar-close" onclick="event.stopPropagation(); app.exitCookMode()" aria-label="Kochmodus beenden">×</button>
+          </div>
+        `;
+      }
+
       renderCookMode() {
-        if (!this.state.cookMode || !this.state.selectedRecipe) return '';
-        const r = this.state.selectedRecipe;
+        const cm = this.state.cookMode;
+        if (!cm) return '';
+        if (cm.minimized) return '';
+        const r = this._findRecipeById(cm.recipeId) || this.state.selectedRecipe;
+        if (!r) return '';
         const steps = r.steps || [];
-        const idx = this.state.cookMode.stepIndex;
+        const idx = cm.stepIndex;
         const step = steps[idx] || '';
         const timerInfo = this.extractTimerFromStep(step);
         const t = this.state.cookTimer;
         const progress = ((idx + 1) / Math.max(1, steps.length)) * 100;
+        const running = this._cookTimerIsRunning();
+        const paused = !!(t && t.pausedRemaining != null);
+        const timerBelongsToThisStep = !!(t && t.recipeId === r.id && t.stepIndex === idx);
+        const remSecs = t ? Math.ceil(this._cookTimerRemainingMs() / 1000) : 0;
 
+        // Timer box – full – only on step where timer was started.
         let timerHtml = '';
-        if (timerInfo || t) {
-          if (t) {
-            timerHtml = `
-              <div class="cook-timer-box">
-                <span id="cook-timer-display" class="cook-timer-display">${this.formatCookTime(t.remaining)}</span>
-                <div style="display:flex; gap:8px;">
-                  <button class="cook-timer-btn ${t.running ? 'running' : ''}" onclick="app.toggleCookTimer()">${t.running ? 'Pause' : 'Weiter'}</button>
-                  <button class="cook-timer-btn reset" onclick="app.resetCookTimer()">Reset</button>
-                </div>
-              </div>`;
-          } else {
-            timerHtml = `
-              <div class="cook-timer-box">
-                <span class="cook-timer-display">${escapeHtml(timerInfo.label)}</span>
+        if (timerBelongsToThisStep && t) {
+          timerHtml = `
+            <div class="cook-timer-box ${running ? 'running' : ''}">
+              <span data-cook-timer-display class="cook-timer-display">${this.formatCookTime(remSecs)}</span>
+              <div class="cook-timer-actions">
+                <button class="cook-timer-btn ${running ? 'running' : ''}" onclick="app.toggleCookTimer()">${paused ? 'Weiter' : 'Pause'}</button>
+                <button class="cook-timer-btn reset" onclick="app.resetCookTimer()">Reset</button>
+              </div>
+            </div>`;
+        } else if (timerInfo && !t) {
+          timerHtml = `
+            <div class="cook-timer-box">
+              <span class="cook-timer-display">${escapeHtml(timerInfo.label)}</span>
+              <div class="cook-timer-actions">
                 <button class="cook-timer-btn" onclick="app.startCookTimer(${timerInfo.seconds})">Timer starten</button>
-              </div>`;
-          }
+              </div>
+            </div>`;
+        }
+
+        // Header compact chip when a timer runs on a DIFFERENT step of the SAME recipe.
+        let headerChipHtml = '';
+        if (t && t.recipeId === r.id && !timerBelongsToThisStep) {
+          const chipCls = paused ? 'paused' : 'pulsing';
+          headerChipHtml = `
+            <button class="cook-header-chip ${chipCls}" onclick="app.jumpToTimerStep()" title="Zum Timer-Schritt springen">
+              ⏱ <span data-cook-timer-display>${this.formatCookTime(remSecs)}</span>
+            </button>`;
         }
 
         return `
@@ -5085,14 +5384,23 @@
                ontouchstart="app._cookTouchX=event.touches[0].clientX"
                ontouchend="app._handleCookSwipe(event)">
             <div class="cook-header">
-              <span class="cook-title">${escapeHtml(r.title)}</span>
-              <button class="cook-close" onclick="app.exitCookMode()">×</button>
+              <div class="cook-title-wrap">
+                <span class="cook-title">Kochmodus</span>
+                <span class="cook-title-recipe">${escapeHtml(r.title)}</span>
+              </div>
+              <div class="cook-header-actions">
+                ${headerChipHtml}
+                <button class="cook-icon-btn" onclick="app.minimizeCookMode()" aria-label="Minimieren" title="Minimieren">⌄</button>
+                <button class="cook-icon-btn" onclick="app.exitCookMode()" aria-label="Beenden" title="Beenden">×</button>
+              </div>
             </div>
             <div class="cook-progress"><div class="cook-progress-bar" style="width:${progress}%"></div></div>
             <div class="cook-body">
-              <div class="cook-step-num">Schritt ${idx + 1} von ${steps.length}</div>
-              <div class="cook-step-text">${escapeHtml(step)}</div>
-              ${timerHtml}
+              <div class="cook-step-anim" key="s${idx}">
+                <div class="cook-step-num">Schritt ${idx + 1} von ${steps.length}</div>
+                <div class="cook-step-text">${escapeHtml(step)}</div>
+                ${timerHtml}
+              </div>
             </div>
             <div class="cook-footer">
               <button class="cook-nav-btn cook-nav-prev" onclick="app.cookPrevStep()" ${idx === 0 ? 'disabled' : ''}>← Zurück</button>
@@ -5100,6 +5408,14 @@
             </div>
           </div>
         `;
+      }
+
+      jumpToTimerStep() {
+        const t = this.state.cookTimer;
+        if (!t || !this.state.cookMode) return;
+        this.state.cookMode.stepIndex = t.stepIndex;
+        this._writeCookPersist();
+        this.render();
       }
 
       _handleCookSwipe(event) {
@@ -5110,6 +5426,8 @@
         if (Math.abs(dx) < 60) return;
         if (dx < 0) this.cookNextStep(); else this.cookPrevStep();
       }
+
+
 
       getCuisineLabel(category) {
         const map = {
